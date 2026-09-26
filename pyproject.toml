@@ -1,0 +1,12 @@
+[project]
+name = "documentingestsurya"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.13.5",
+    "pypdfium2>=5.13.0",
+    "pyyaml>=6.0.3",
+    "surya-ocr>=0.22.1",
+]
