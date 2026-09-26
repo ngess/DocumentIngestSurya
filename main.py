@@ -1,8 +1,11 @@
+import ctypes
 import json
+import math
 from argparse import ArgumentParser
 from pathlib import Path
 
 import pypdfium2 as pdfium
+import pypdfium2.raw as raw
 
 from PIL import ImageDraw, ImageFont
 from pydantic import BaseModel
@@ -45,65 +48,116 @@ def load_pdf(
 
             page_box = page.get_cropbox()
 
-            words = extract_text(page)
+            words, symbols = extract_text(page)
 
             images.append({
                 "page_index": page_index,
                 "image": bitmap.to_pil(),
                 "words": words,
+                "symbols": symbols,
                 "page_box": page_box,
             })
     return images
 
 
 
-def extract_text(page: pdfium.PdfPage) -> list[dict]:
+# PDF font descriptor flag (PDF 32000-1:2008, table 123, bit 7)
+FONT_FLAG_ITALIC = 0x40
+
+
+def extract_symbol(
+    textpage: pdfium.PdfTextPage,
+    index: int,
+    char: str,
+) -> dict:
+    """Read one character's geometry and font info, in PDF coordinates."""
+    origin_x = ctypes.c_double()
+    origin_y = ctypes.c_double()
+    raw.FPDFText_GetCharOrigin(textpage.raw, index, origin_x, origin_y)
+
+    # Many PDFs set the font size to 1 and scale glyphs with the text
+    # matrix, so the effective size is the matrix's vertical scale.
+    matrix = raw.FS_MATRIX()
+    raw.FPDFText_GetMatrix(textpage.raw, index, matrix)
+    font_size = (
+        raw.FPDFText_GetFontSize(textpage.raw, index)
+        * math.hypot(matrix.c, matrix.d)
+    )
+
+    # The loose box spans the font's full ascent/descent, so its height is
+    # consistent across glyphs of the same size (unlike the tight glyph box).
+    loose = raw.FS_RECTF()
+    raw.FPDFText_GetLooseCharBox(textpage.raw, index, loose)
+
+    flags = ctypes.c_int()
+    name_length = raw.FPDFText_GetFontInfo(textpage.raw, index, None, 0, flags)
+    name_buffer = ctypes.create_string_buffer(name_length)
+    raw.FPDFText_GetFontInfo(textpage.raw, index, name_buffer, name_length, flags)
+
+    return {
+        "text": char,
+        "bbox": textpage.get_charbox(index),
+        "loose_bbox": (loose.left, loose.bottom, loose.right, loose.top),
+        "origin": (origin_x.value, origin_y.value),
+        "font_size": font_size,
+        "font_name": name_buffer.value.decode("utf-8", errors="replace"),
+        "italic": bool(flags.value & FONT_FLAG_ITALIC),
+    }
+
+
+def extract_text(page: pdfium.PdfPage) -> tuple[list[dict], list[dict]]:
+    """Extract words and their individual symbols (non-whitespace characters).
+
+    Words are runs of symbols between whitespace. Each word lists the indices
+    of its symbols, and each symbol records the index of its word.
+    """
     textpage = page.get_textpage()
     num_chars = textpage.count_chars()
 
     words = []
-    current_chars = []
-    current_boxes = []
+    symbols = []
+    current = []
+
+    def close_word():
+        if not current:
+            return
+
+        boxes = [symbols[i]["bbox"] for i in current]
+
+        for i in current:
+            symbols[i]["word"] = len(words)
+
+        words.append({
+            "text": "".join(symbols[i]["text"] for i in current),
+            "bbox": (
+                min(b[0] for b in boxes),
+                min(b[1] for b in boxes),
+                max(b[2] for b in boxes),
+                max(b[3] for b in boxes),
+            ),
+            "symbols": list(current),
+        })
+        current.clear()
 
     for i in range(num_chars):
         char = textpage.get_text_range(index=i, count=1)
-        charbox = textpage.get_charbox(i)
 
         if char.isspace():
-            if current_chars:
-                w_left = min(b[0] for b in current_boxes)
-                w_bottom = min(b[1] for b in current_boxes)
-                w_right = max(b[2] for b in current_boxes)
-                w_top = max(b[3] for b in current_boxes)
-
-                words.append({
-                    "text": "".join(current_chars),
-                    "bbox": (w_left, w_bottom, w_right, w_top),
-                })
-                current_chars.clear()
-                current_boxes.clear()
+            close_word()
         else:
-            current_chars.append(char)
-            current_boxes.append(charbox)
+            current.append(len(symbols))
+            symbols.append(extract_symbol(textpage, i, char))
 
-    if current_chars:
-        w_left = min(b[0] for b in current_boxes)
-        w_bottom = min(b[1] for b in current_boxes)
-        w_right = max(b[2] for b in current_boxes)
-        w_top = max(b[3] for b in current_boxes)
+    close_word()
 
-        words.append({
-            "text": "".join(current_chars),
-            "bbox": (w_left, w_bottom, w_right, w_top),
-        })
-
-    return words
+    return words, symbols
 
 
 def write_html_viewer(
     page: dict,
     blocks: list[dict],
     words: list[dict],
+    symbols: list[dict],
     output_path: Path,
 ) -> None:
     image = page["image"]
@@ -116,6 +170,7 @@ def write_html_viewer(
         "height": height,
         "blocks": blocks,
         "words": words,
+        "symbols": symbols,
     }
 
     data_json = json.dumps(data)
@@ -201,6 +256,14 @@ def write_html_viewer(
             cursor: pointer;
         }}
 
+        .symbol-box {{
+            fill: rgba(0, 180, 0, 0.08);
+            stroke: #00a000;
+            stroke-width: 0.5;
+            pointer-events: all;
+            cursor: pointer;
+        }}
+
         .surya-label {{
             fill: red;
             font-size: 16px;
@@ -266,6 +329,14 @@ def write_html_viewer(
             id="toggle-word-labels"
         >
         Word Labels
+    </label>
+
+    <label>
+        <input
+            type="checkbox"
+            id="toggle-symbols"
+        >
+        Symbols
     </label>
 
     <button id="zoom-in">
@@ -345,6 +416,22 @@ const wordGroup = document.createElementNS(
 wordGroup.id = "word-group";
 
 svg.appendChild(wordGroup);
+
+
+// ---------------------------------------------------------
+// Symbol group (drawn last so symbols sit above words)
+// ---------------------------------------------------------
+
+const symbolGroup = document.createElementNS(
+    SVG_NS,
+    "g"
+);
+
+symbolGroup.id = "symbol-group";
+
+symbolGroup.style.display = "none";
+
+svg.appendChild(symbolGroup);
 
 
 // ---------------------------------------------------------
@@ -448,7 +535,7 @@ for (const word of data.words) {{
             document.getElementById(
                 "info"
             ).textContent =
-                `PDFium | "${{word.text}}" | block: ${{word.block ?? "none"}} | image=${{JSON.stringify(word.bbox)}} | pdf=${{JSON.stringify(word.pdf_bbox)}}`;
+                `PDFium | "${{word.text}}" | block: ${{word.block ?? "none"}} | symbols: ${{word.symbols.length}} | image=${{JSON.stringify(word.bbox)}} | pdf=${{JSON.stringify(word.pdf_bbox)}}`;
         }}
     );
 
@@ -473,6 +560,53 @@ for (const word of data.words) {{
     text.style.display = "none";
 
     wordGroup.appendChild(text);
+}}
+
+
+// ---------------------------------------------------------
+// Draw PDFium symbols
+// ---------------------------------------------------------
+
+for (const symbol of data.symbols) {{
+
+    const [x1, y1, x2, y2] = symbol.bbox;
+
+    const rect = document.createElementNS(
+        SVG_NS,
+        "rect"
+    );
+
+    rect.setAttribute("x", x1);
+    rect.setAttribute("y", y1);
+
+    rect.setAttribute(
+        "width",
+        x2 - x1
+    );
+
+    rect.setAttribute(
+        "height",
+        y2 - y1
+    );
+
+    rect.setAttribute(
+        "class",
+        "symbol-box"
+    );
+
+    rect.addEventListener(
+        "click",
+        () => {{
+            const word = data.words[symbol.word];
+
+            document.getElementById(
+                "info"
+            ).textContent =
+                `Symbol | "${{symbol.text}}" | word: "${{word.text}}" | block: ${{symbol.block ?? "none"}} | size: ${{symbol.font_size.toFixed(2)}}pt | baseline y: ${{symbol.origin[1].toFixed(1)}} | ${{symbol.font_name}}${{symbol.italic ? " (italic)" : ""}}`;
+        }}
+    );
+
+    symbolGroup.appendChild(rect);
 }}
 
 
@@ -506,6 +640,19 @@ document
                             ? ""
                             : "none";
                 }});
+        }}
+    );
+
+
+document
+    .getElementById("toggle-symbols")
+    .addEventListener(
+        "change",
+        event => {{
+            symbolGroup.style.display =
+                event.target.checked
+                    ? ""
+                    : "none";
         }}
     );
 
@@ -668,14 +815,23 @@ def write_layout_results(
             image.size,
         )
 
+        page_symbols = symbols_to_image(
+            page["symbols"],
+            page_words,
+            page["page_box"],
+            image.size,
+        )
+
         blocks = []
 
         for block in ordered_blocks:
             words = [
                 {
+                    "id": word["id"],
                     "text": word["text"],
                     "bbox": word["bbox"],
                     "pdf_bbox": word["pdf_bbox"],
+                    "symbols": word["symbols"],
                 }
                 for word in page_words
                 if word["block"] == block.position
@@ -703,6 +859,7 @@ def write_layout_results(
             "height": image.height,
             "page_box": list(page["page_box"]),
             "blocks": blocks,
+            "symbols": page_symbols,
         }
 
         # ---------------------------------------------------------
@@ -946,6 +1103,7 @@ def write_layout_results(
             page,
             blocks,
             page_words,
+            page_symbols,
             page_dir / "viewer.html",
         )
 
@@ -1185,7 +1343,7 @@ def assign_words_to_blocks(
     """
     assigned = []
 
-    for word in words:
+    for word_id, word in enumerate(words):
         image_bbox = pdf_bbox_to_image_bbox(
             word["bbox"],
             page_box,
@@ -1209,13 +1367,71 @@ def assign_words_to_blocks(
         )
 
         assigned.append({
+            "id": word_id,
             "text": word["text"],
             "bbox": list(image_bbox),
             "pdf_bbox": list(word["bbox"]),
             "block": owner.position if owner else None,
+            "symbols": word["symbols"],
         })
 
     return assigned
+
+
+def pdf_point_to_image_point(
+    point: tuple[float, float],
+    page_box: tuple[float, float, float, float],
+    image_size: tuple[int, int],
+) -> tuple[float, float]:
+    x, y, _, _ = pdf_bbox_to_image_bbox(
+        (point[0], point[1], point[0], point[1]),
+        page_box,
+        image_size,
+    )
+    return x, y
+
+
+def symbols_to_image(
+    symbols: list[dict],
+    words: list[dict],
+    page_box,
+    image_size,
+) -> list[dict]:
+    """Convert symbols to image coordinates; each inherits its word's block."""
+    converted = []
+
+    for symbol_id, symbol in enumerate(symbols):
+        origin = pdf_point_to_image_point(
+            symbol["origin"],
+            page_box,
+            image_size,
+        )
+
+        converted.append({
+            "id": symbol_id,
+            "text": symbol["text"],
+            "bbox": list(pdf_bbox_to_image_bbox(
+                symbol["bbox"],
+                page_box,
+                image_size,
+            )),
+            "pdf_bbox": list(symbol["bbox"]),
+            "loose_bbox": list(pdf_bbox_to_image_bbox(
+                symbol["loose_bbox"],
+                page_box,
+                image_size,
+            )),
+            # Glyph origin: the pen position on the baseline.
+            "origin": list(origin),
+            "pdf_origin": list(symbol["origin"]),
+            "font_size": symbol["font_size"],
+            "font_name": symbol["font_name"],
+            "italic": symbol["italic"],
+            "word": symbol["word"],
+            "block": words[symbol["word"]]["block"],
+        })
+
+    return converted
 
 if __name__ == "__main__":
     parser = ArgumentParser()
